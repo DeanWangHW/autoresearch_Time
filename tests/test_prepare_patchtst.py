@@ -32,6 +32,7 @@ class PrepareEntrypointTests(unittest.TestCase):
         smoke = next(item for item in report["checks"] if item["name"] == "patchtst_horizon96_smoke")
         self.assertEqual(smoke["status"], "pass")
         self.assertEqual(smoke["details"]["pred_len"], 96)
+        self.assertEqual(smoke["details"]["stop_reason"], "time_budget")
         self.assertIn("mse", smoke["details"]["test_metrics"])
 
 

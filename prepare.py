@@ -114,10 +114,11 @@ def check_etth1_dataset() -> dict[str, Any]:
 def check_train_module_import() -> tuple[dict[str, Any], Any]:
     train = importlib.import_module("train")
     required = [
-        "PatchTSTConfig",
-        "PatchTSTTrainer",
-        "PatchTSTResearcher",
-        "make_smoke_config",
+        "PRED_LEN",
+        "TRAIN_TIME_BUDGET",
+        "build_config",
+        "make_smoke_overrides",
+        "run_experiment",
     ]
     missing = [name for name in required if not hasattr(train, name)]
     if missing:
@@ -135,26 +136,26 @@ def check_train_module_import() -> tuple[dict[str, Any], Any]:
 
 def run_patchtst_horizon96_smoke(train_module: Any) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="patchtst-smoke-") as tmpdir:
-        config = train_module.make_smoke_config(
-            train_module.PatchTSTConfig(
-                output_root=tmpdir,
-                num_workers=0,
-                save_predictions=False,
-            )
+        overrides = train_module.make_smoke_overrides(
+            output_root=tmpdir,
+            train_time_budget=0.01,
         )
+        config = train_module.build_config(overrides)
         if config.pred_len != 96:
             raise RuntimeError(f"Smoke config pred_len must be 96, got {config.pred_len}")
 
         log_buffer = io.StringIO()
         with redirect_stdout(log_buffer), redirect_stderr(log_buffer):
-            summary = train_module.PatchTSTTrainer(config).run()
+            summary = train_module.run_experiment(overrides=overrides)
 
     return _pass(
         "patchtst_horizon96_smoke",
         pred_len=config.pred_len,
         device=summary["device"],
         output_root=tmpdir,
-        train_epochs=len(summary["train"]["history"]),
+        num_steps=summary["train"]["num_steps"],
+        stop_reason=summary["train"]["stop_reason"],
+        training_seconds=summary["train"]["training_seconds"],
         val_metrics=summary["val"],
         test_metrics=summary["test"],
         log_tail=log_buffer.getvalue().strip().splitlines()[-12:],

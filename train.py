@@ -9,14 +9,14 @@ selection metric. The default task is ETTh1 with horizon 96.
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import math
 import os
 import random
+import time
 from contextlib import nullcontext
-from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import numpy as np
@@ -28,7 +28,6 @@ from pandas.tseries import offsets
 from pandas.tseries.frequencies import to_offset
 from sklearn.preprocessing import StandardScaler
 from torch import Tensor, optim
-from torch.optim import lr_scheduler
 from torch.utils.data import DataLoader, Dataset
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -38,6 +37,63 @@ DEFAULT_OUTPUT_ROOT = REPO_ROOT / "runs" / "patchtst"
 MPLCONFIGDIR = REPO_ROOT / ".mplconfig"
 MPLCONFIGDIR.mkdir(exist_ok=True)
 os.environ.setdefault("MPLCONFIGDIR", str(MPLCONFIGDIR))
+
+
+# -----------------------------------------------------------------------------
+# Editable hyperparameters
+# -----------------------------------------------------------------------------
+
+# Data
+MODEL = "PatchTST"
+MODEL_ID = "ETTh1_336_96"
+DATA = "ETTh1"
+ROOT_PATH = str(DEFAULT_DATA_ROOT)
+DATA_PATH = "ETTh1.csv"
+FEATURES = "M"
+TARGET = "OT"
+FREQ = "h"
+
+# Forecasting target
+SEQ_LEN = 336
+LABEL_LEN = 48
+PRED_LEN = 96
+
+# PatchTST architecture
+PATCH_LEN = 16
+STRIDE = 8
+D_MODEL = 16
+N_HEADS = 4
+E_LAYERS = 3
+D_FF = 128
+DROPOUT = 0.3
+FC_DROPOUT = 0.3
+HEAD_DROPOUT = 0.0
+EMBED = "timeF"
+ACTIVATION = "gelu"
+PADDING_PATCH = "end"
+REVIN = 1
+AFFINE = 0
+SUBTRACT_LAST = 0
+DECOMPOSITION = 0
+KERNEL_SIZE = 25
+INDIVIDUAL = 0
+
+# Training
+RANDOM_SEED = 2021
+BATCH_SIZE = 128
+LEARNING_RATE = 1e-4
+TRAIN_TIME_BUDGET = 300.0
+WARMUP_RATIO = 0.0
+FINAL_LR_RATIO = 1.0
+DEVICE = "auto"
+USE_AMP = False
+NUM_WORKERS = 0
+MAX_TRAIN_STEPS = None
+MAX_EVAL_STEPS = None
+
+# Runtime
+OUTPUT_ROOT = str(DEFAULT_OUTPUT_ROOT)
+SAVE_PREDICTIONS = True
 
 
 # -----------------------------------------------------------------------------
@@ -73,87 +129,6 @@ def detect_device(requested: str = "auto") -> torch.device:
     if requested == "cpu":
         return torch.device("cpu")
     raise ValueError(f"Unsupported device: {requested}")
-
-
-
-def apply_config_overrides(config: "PatchTSTConfig", overrides: dict[str, Any] | None = None) -> "PatchTSTConfig":
-    if not overrides:
-        return config
-    payload = config.to_dict()
-    for key, value in overrides.items():
-        if key not in payload:
-            raise KeyError(f"Unknown config override: {key}")
-        payload[key] = value
-    return PatchTSTConfig(**payload)
-
-
-
-def adjust_learning_rate(
-    optimizer: optim.Optimizer,
-    scheduler: lr_scheduler._LRScheduler | lr_scheduler.OneCycleLR,
-    epoch: int,
-    config: "PatchTSTConfig",
-    printout: bool = True,
-) -> None:
-    if config.lradj == "type1":
-        lr_adjust = {epoch: config.learning_rate * (0.5 ** ((epoch - 1) // 1))}
-    elif config.lradj == "type2":
-        lr_adjust = {2: 5e-5, 4: 1e-5, 6: 5e-6, 8: 1e-6, 10: 5e-7, 15: 1e-7, 20: 5e-8}
-    elif config.lradj == "type3":
-        lr_adjust = {
-            epoch: config.learning_rate
-            if epoch < 3
-            else config.learning_rate * (0.9 ** ((epoch - 3) // 1))
-        }
-    elif config.lradj == "constant":
-        lr_adjust = {epoch: config.learning_rate}
-    elif config.lradj == "3":
-        lr_adjust = {epoch: config.learning_rate if epoch < 10 else config.learning_rate * 0.1}
-    elif config.lradj == "4":
-        lr_adjust = {epoch: config.learning_rate if epoch < 15 else config.learning_rate * 0.1}
-    elif config.lradj == "5":
-        lr_adjust = {epoch: config.learning_rate if epoch < 25 else config.learning_rate * 0.1}
-    elif config.lradj == "6":
-        lr_adjust = {epoch: config.learning_rate if epoch < 5 else config.learning_rate * 0.1}
-    elif config.lradj == "TST":
-        lr_adjust = {epoch: scheduler.get_last_lr()[0]}
-    else:
-        raise ValueError(f"Unsupported lradj mode: {config.lradj}")
-
-    if epoch in lr_adjust:
-        lr = lr_adjust[epoch]
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = lr
-        if printout:
-            print(f"Updating learning rate to {lr}")
-
-
-
-class EarlyStopping:
-    def __init__(self, patience: int = 7, delta: float = 0.0) -> None:
-        self.patience = patience
-        self.delta = delta
-        self.counter = 0
-        self.best_score: float | None = None
-        self.early_stop = False
-        self.val_loss_min = math.inf
-
-    def __call__(self, val_loss: float, model: nn.Module, checkpoint_path: Path) -> None:
-        score = -val_loss
-        if self.best_score is None or score >= self.best_score + self.delta:
-            self.best_score = score
-            self.save_checkpoint(val_loss, model, checkpoint_path)
-            self.counter = 0
-            return
-        self.counter += 1
-        print(f"EarlyStopping counter: {self.counter} out of {self.patience}")
-        if self.counter >= self.patience:
-            self.early_stop = True
-
-    def save_checkpoint(self, val_loss: float, model: nn.Module, checkpoint_path: Path) -> None:
-        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(model.state_dict(), checkpoint_path)
-        self.val_loss_min = val_loss
 
 
 
@@ -387,7 +362,7 @@ DATASET_MAP = {
 
 
 
-def data_provider(config: "PatchTSTConfig", flag: str) -> tuple[Dataset, DataLoader]:
+def data_provider(config: SimpleNamespace | Any, flag: str) -> tuple[Dataset, DataLoader]:
     data_cls = DATASET_MAP[config.data]
     timeenc = 1 if config.embed == "timeF" else 0
     if flag == "test":
@@ -983,7 +958,7 @@ class PatchTSTBackbone(nn.Module):
 
 
 class PatchTSTModel(nn.Module):
-    def __init__(self, config: "PatchTSTConfig") -> None:
+    def __init__(self, config: SimpleNamespace | Any) -> None:
         super().__init__()
         c_in = config.enc_in
         context_window = config.seq_len
@@ -1030,513 +1005,317 @@ class PatchTSTModel(nn.Module):
 
 
 # -----------------------------------------------------------------------------
-# Training and research configs
+# Direct training entrypoint
 # -----------------------------------------------------------------------------
 
 
-@dataclass
-class PatchTSTConfig:
-    random_seed: int = 2021
-    model_id: str = "ETTh1_336_96"
-    model: str = "PatchTST"
-    data: str = "ETTh1"
-    root_path: str = str(DEFAULT_DATA_ROOT)
-    data_path: str = "ETTh1.csv"
-    features: str = "M"
-    target: str = "OT"
-    freq: str = "h"
-
-    seq_len: int = 336
-    label_len: int = 48
-    pred_len: int = 96
-
-    fc_dropout: float = 0.3
-    head_dropout: float = 0.0
-    patch_len: int = 16
-    stride: int = 8
-    padding_patch: str = "end"
-    revin: int = 1
-    affine: int = 0
-    subtract_last: int = 0
-    decomposition: int = 0
-    kernel_size: int = 25
-    individual: int = 0
-
-    embed_type: int = 0
-    enc_in: int = 7
-    dec_in: int = 7
-    c_out: int = 7
-    d_model: int = 16
-    n_heads: int = 4
-    e_layers: int = 3
-    d_layers: int = 1
-    d_ff: int = 128
-    moving_avg: int = 25
-    factor: int = 1
-    distil: bool = True
-    dropout: float = 0.3
-    embed: str = "timeF"
-    activation: str = "gelu"
-    output_attention: bool = False
-
-    num_workers: int = 0
-    train_epochs: int = 20
-    batch_size: int = 128
-    patience: int = 5
-    learning_rate: float = 1e-4
-    des: str = "Exp"
-    loss: str = "mse"
-    lradj: str = "type3"
-    pct_start: float = 0.3
-    use_amp: bool = False
-
-    device: str = "auto"
-    output_root: str = str(DEFAULT_OUTPUT_ROOT)
-    checkpoints: str = ""
-    results_dir: str = ""
-    test_results_dir: str = ""
-    results_file: str = ""
-    save_predictions: bool = True
-
-    max_train_steps_per_epoch: int | None = None
-    max_eval_steps: int | None = None
-
-    def __post_init__(self) -> None:
-        output_root = Path(self.output_root)
-        if not self.checkpoints:
-            self.checkpoints = str(output_root / "checkpoints")
-        if not self.results_dir:
-            self.results_dir = str(output_root / "results")
-        if not self.test_results_dir:
-            self.test_results_dir = str(output_root / "test_results")
-        if not self.results_file:
-            self.results_file = str(output_root / "research_results.tsv")
-        if self.features == "S":
-            self.enc_in = self.dec_in = self.c_out = 1
-        elif self.data.startswith("ETT") and self.enc_in == 1:
-            self.enc_in = self.dec_in = self.c_out = 7
-        if self.model != "PatchTST":
-            raise ValueError("This single-file entrypoint only supports PatchTST.")
-        if self.pred_len != 96 and "smoke" not in self.model_id.lower():
-            # The project focus is fixed on horizon 96; keep this explicit in normal runs.
-            print(f"Warning: current run uses pred_len={self.pred_len}, not the default focus of 96.")
-
-    def setting(self) -> str:
-        return (
-            f"{self.model_id}_{self.model}_{self.data}_ft{self.features}_sl{self.seq_len}"
-            f"_ll{self.label_len}_pl{self.pred_len}_dm{self.d_model}_nh{self.n_heads}"
-            f"_el{self.e_layers}_dl{self.d_layers}_df{self.d_ff}_fc{self.factor}"
-            f"_eb{self.embed}_dt{self.distil}_{self.des}"
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
-
-def make_smoke_config(config: PatchTSTConfig) -> PatchTSTConfig:
-    return replace(
-        config,
-        model_id=f"{config.data}_smoke96",
-        seq_len=96,
-        label_len=48,
-        pred_len=96,
-        d_model=8,
-        n_heads=2,
-        e_layers=1,
-        d_layers=1,
-        d_ff=32,
-        batch_size=8,
-        train_epochs=1,
-        patience=1,
-        num_workers=0,
-        max_train_steps_per_epoch=1,
-        max_eval_steps=1,
+def build_setting(config: SimpleNamespace) -> str:
+    return (
+        f"{config.model_id}_{config.model}_{config.data}_ft{config.features}_sl{config.seq_len}"
+        f"_ll{config.label_len}_pl{config.pred_len}_dm{config.d_model}_nh{config.n_heads}"
+        f"_el{config.e_layers}_df{config.d_ff}_eb{config.embed}"
     )
 
 
-@dataclass
-class TrialResult:
-    name: str
-    config: dict[str, Any]
-    metrics: dict[str, float]
-    test_metrics: dict[str, float]
-    summary: dict[str, Any]
-    description: str = ""
+def build_config(overrides: dict[str, Any] | None = None) -> SimpleNamespace:
+    config = {
+        "random_seed": RANDOM_SEED,
+        "model": MODEL,
+        "model_id": MODEL_ID,
+        "data": DATA,
+        "root_path": str(ROOT_PATH),
+        "data_path": DATA_PATH,
+        "features": FEATURES,
+        "target": TARGET,
+        "freq": FREQ,
+        "seq_len": SEQ_LEN,
+        "label_len": LABEL_LEN,
+        "pred_len": PRED_LEN,
+        "patch_len": PATCH_LEN,
+        "stride": STRIDE,
+        "d_model": D_MODEL,
+        "n_heads": N_HEADS,
+        "e_layers": E_LAYERS,
+        "d_ff": D_FF,
+        "dropout": DROPOUT,
+        "fc_dropout": FC_DROPOUT,
+        "head_dropout": HEAD_DROPOUT,
+        "embed": EMBED,
+        "activation": ACTIVATION,
+        "padding_patch": PADDING_PATCH,
+        "revin": REVIN,
+        "affine": AFFINE,
+        "subtract_last": SUBTRACT_LAST,
+        "decomposition": DECOMPOSITION,
+        "kernel_size": KERNEL_SIZE,
+        "individual": INDIVIDUAL,
+        "batch_size": BATCH_SIZE,
+        "learning_rate": LEARNING_RATE,
+        "train_time_budget": float(TRAIN_TIME_BUDGET),
+        "warmup_ratio": float(WARMUP_RATIO),
+        "final_lr_ratio": float(FINAL_LR_RATIO),
+        "device": DEVICE,
+        "use_amp": USE_AMP,
+        "num_workers": NUM_WORKERS,
+        "max_train_steps": MAX_TRAIN_STEPS,
+        "max_eval_steps": MAX_EVAL_STEPS,
+        "output_root": str(OUTPUT_ROOT),
+        "save_predictions": SAVE_PREDICTIONS,
+        "enc_in": 7,
+        "dec_in": 7,
+        "c_out": 7,
+    }
+    if overrides:
+        unknown = sorted(set(overrides) - set(config))
+        if unknown:
+            raise KeyError(f"Unknown config override(s): {unknown}")
+        config.update(overrides)
+
+    if config["model"] != "PatchTST":
+        raise ValueError("This entrypoint only supports PatchTST.")
+    if int(config["pred_len"]) != 96:
+        raise ValueError(f"This project is fixed to horizon 96, got pred_len={config['pred_len']}")
+    if config["features"] == "S":
+        config["enc_in"] = config["dec_in"] = config["c_out"] = 1
+    config["output_root"] = str(config["output_root"])
+    config["checkpoints"] = str(Path(config["output_root"]) / "checkpoints")
+    config["results_dir"] = str(Path(config["output_root"]) / "results")
+    namespace = SimpleNamespace(**config)
+    namespace.setting = build_setting(namespace)
+    return namespace
 
 
-# -----------------------------------------------------------------------------
-# Training and evaluation
-# -----------------------------------------------------------------------------
+def config_to_dict(config: SimpleNamespace) -> dict[str, Any]:
+    return {key: value for key, value in vars(config).items()}
 
 
-class PatchTSTTrainer:
-    def __init__(self, config: PatchTSTConfig) -> None:
-        self.config = config
-        self.device = detect_device(config.device)
-        self.use_amp = config.use_amp and self.device.type == "cuda"
-        set_seed(config.random_seed)
-        self.model = PatchTSTModel(config).float().to(self.device)
+def make_smoke_overrides(
+    output_root: str | None = None,
+    train_time_budget: float = 0.01,
+) -> dict[str, Any]:
+    overrides: dict[str, Any] = {
+        "model_id": f"{DATA}_smoke96",
+        "seq_len": 96,
+        "label_len": 48,
+        "pred_len": 96,
+        "patch_len": 8,
+        "stride": 4,
+        "d_model": 8,
+        "n_heads": 2,
+        "e_layers": 1,
+        "d_ff": 32,
+        "dropout": 0.1,
+        "fc_dropout": 0.1,
+        "batch_size": 8,
+        "train_time_budget": float(train_time_budget),
+        "num_workers": 0,
+        "max_eval_steps": 1,
+        "save_predictions": False,
+    }
+    if output_root is not None:
+        overrides["output_root"] = output_root
+    return overrides
 
-    def _select_optimizer(self) -> optim.Optimizer:
-        return optim.Adam(self.model.parameters(), lr=self.config.learning_rate)
 
-    def _select_criterion(self) -> nn.Module:
-        if self.config.loss != "mse":
-            raise ValueError(f"Unsupported loss: {self.config.loss}")
-        return nn.MSELoss()
+def autocast_context(device: torch.device, use_amp: bool):
+    if use_amp and device.type == "cuda":
+        return torch.amp.autocast("cuda", dtype=torch.bfloat16)
+    return nullcontext()
 
-    def _prepare_batch(self, batch: tuple[Tensor, ...]) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        batch_x, batch_y, batch_x_mark, batch_y_mark = batch
-        return (
-            batch_x.float().to(self.device),
-            batch_y.float().to(self.device),
-            batch_x_mark.float().to(self.device),
-            batch_y_mark.float().to(self.device),
-        )
 
-    def _autocast_context(self):
-        if self.use_amp:
-            return torch.cuda.amp.autocast()
-        return nullcontext()
+def create_grad_scaler(device: torch.device, use_amp: bool):
+    if device.type == "cuda":
+        return torch.amp.GradScaler("cuda", enabled=use_amp)
+    return None
 
-    def _limit_steps(self, step_idx: int, max_steps: int | None) -> bool:
-        return max_steps is not None and step_idx >= max_steps
 
-    def _run_model(self, batch_x: Tensor, batch_y: Tensor, batch_x_mark: Tensor, batch_y_mark: Tensor) -> tuple[Tensor, Tensor]:
-        del batch_x_mark, batch_y_mark
-        outputs = self.model(batch_x)
-        f_dim = -1 if self.config.features == "MS" else 0
-        outputs = outputs[:, -self.config.pred_len :, f_dim:]
-        target = batch_y[:, -self.config.pred_len :, f_dim:]
-        return outputs, target
+def prepare_batch(batch: tuple[Tensor, ...], device: torch.device) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    batch_x, batch_y, batch_x_mark, batch_y_mark = batch
+    return (
+        batch_x.float().to(device),
+        batch_y.float().to(device),
+        batch_x_mark.float().to(device),
+        batch_y_mark.float().to(device),
+    )
 
-    def evaluate_loss(self, loader: DataLoader, criterion: nn.Module, max_steps: int | None = None) -> float:
-        losses: list[float] = []
-        self.model.eval()
-        with torch.no_grad():
-            for step_idx, batch in enumerate(loader):
-                if self._limit_steps(step_idx, max_steps):
-                    break
-                batch_x, batch_y, batch_x_mark, batch_y_mark = self._prepare_batch(batch)
-                with self._autocast_context():
-                    outputs, target = self._run_model(batch_x, batch_y, batch_x_mark, batch_y_mark)
-                    loss = criterion(outputs, target)
-                losses.append(float(loss.detach().cpu().item()))
-        self.model.train()
-        return float(np.mean(losses)) if losses else math.nan
 
-    def train(self) -> dict[str, Any]:
-        _, train_loader = data_provider(self.config, "train")
-        _, val_loader = data_provider(self.config, "val")
-        _, test_loader = data_provider(self.config, "test")
+def run_model(
+    model: PatchTSTModel,
+    config: SimpleNamespace,
+    batch_x: Tensor,
+    batch_y: Tensor,
+    batch_x_mark: Tensor,
+    batch_y_mark: Tensor,
+) -> tuple[Tensor, Tensor]:
+    del batch_x_mark, batch_y_mark
+    outputs = model(batch_x)
+    f_dim = -1 if config.features == "MS" else 0
+    outputs = outputs[:, -config.pred_len :, f_dim:]
+    target = batch_y[:, -config.pred_len :, f_dim:]
+    return outputs, target
 
-        checkpoint_path = Path(self.config.checkpoints) / self.config.setting() / "checkpoint.pth"
-        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
-        effective_steps = len(train_loader)
-        if self.config.max_train_steps_per_epoch is not None:
-            effective_steps = min(effective_steps, self.config.max_train_steps_per_epoch)
-        effective_steps = max(effective_steps, 1)
+def update_learning_rate(optimizer: optim.Optimizer, base_lr: float, progress: float, warmup_ratio: float, final_lr_ratio: float) -> float:
+    progress = min(max(progress, 0.0), 1.0)
+    if warmup_ratio > 0.0 and progress < warmup_ratio:
+        lr = base_lr * max(progress / warmup_ratio, 1e-3)
+    else:
+        decay_progress = 0.0 if warmup_ratio >= 1.0 else (progress - warmup_ratio) / max(1.0 - warmup_ratio, 1e-12)
+        decay_progress = min(max(decay_progress, 0.0), 1.0)
+        lr = base_lr * (1.0 - (1.0 - final_lr_ratio) * decay_progress)
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr
+    return lr
 
-        optimizer = self._select_optimizer()
-        criterion = self._select_criterion()
-        scheduler = lr_scheduler.OneCycleLR(
-            optimizer=optimizer,
-            steps_per_epoch=effective_steps,
-            pct_start=self.config.pct_start,
-            epochs=self.config.train_epochs,
-            max_lr=self.config.learning_rate,
-        )
-        scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
-        early_stopping = EarlyStopping(patience=self.config.patience)
 
-        history: list[dict[str, float]] = []
-        for epoch in range(self.config.train_epochs):
-            losses: list[float] = []
-            self.model.train()
-            for step_idx, batch in enumerate(train_loader):
-                if self._limit_steps(step_idx, self.config.max_train_steps_per_epoch):
-                    break
-                optimizer.zero_grad(set_to_none=True)
-                batch_x, batch_y, batch_x_mark, batch_y_mark = self._prepare_batch(batch)
-                with self._autocast_context():
-                    outputs, target = self._run_model(batch_x, batch_y, batch_x_mark, batch_y_mark)
-                    loss = criterion(outputs, target)
-                if self.use_amp:
-                    scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    loss.backward()
-                    optimizer.step()
-                if self.config.lradj == "TST":
-                    scheduler.step()
-                losses.append(float(loss.detach().cpu().item()))
-
-            train_loss = float(np.mean(losses)) if losses else math.nan
-            val_loss = self.evaluate_loss(val_loader, criterion, self.config.max_eval_steps)
-            test_loss = self.evaluate_loss(test_loader, criterion, self.config.max_eval_steps)
-            history.append({
-                "epoch": float(epoch + 1),
-                "train_loss": train_loss,
-                "val_loss": val_loss,
-                "test_loss": test_loss,
-            })
-            print(
-                f"Epoch {epoch + 1}/{self.config.train_epochs} | "
-                f"train={train_loss:.6f} val={val_loss:.6f} test={test_loss:.6f}"
-            )
-            early_stopping(val_loss, self.model, checkpoint_path)
-            if early_stopping.early_stop:
-                print("Early stopping")
+def evaluate_split(model: PatchTSTModel, config: SimpleNamespace, device: torch.device, split: str) -> dict[str, float]:
+    _, loader = data_provider(config, split)
+    preds: list[np.ndarray] = []
+    trues: list[np.ndarray] = []
+    model.eval()
+    with torch.no_grad():
+        for step_idx, batch in enumerate(loader):
+            if config.max_eval_steps is not None and step_idx >= config.max_eval_steps:
                 break
-            if self.config.lradj != "TST":
-                adjust_learning_rate(optimizer, scheduler, epoch + 1, self.config, printout=False)
+            batch_x, batch_y, batch_x_mark, batch_y_mark = prepare_batch(batch, device)
+            with autocast_context(device, config.use_amp):
+                outputs, target = run_model(model, config, batch_x, batch_y, batch_x_mark, batch_y_mark)
+            preds.append(outputs.detach().cpu().numpy())
+            trues.append(target.detach().cpu().numpy())
+    model.train()
+    if not preds:
+        raise RuntimeError(f"No batches produced for split={split}")
 
-        self.model.load_state_dict(torch.load(checkpoint_path, map_location=self.device))
-        return {"history": history, "checkpoint_path": str(checkpoint_path)}
-
-    def evaluate_split(self, split: str) -> dict[str, float]:
-        _, loader = data_provider(self.config, split)
-        preds: list[np.ndarray] = []
-        trues: list[np.ndarray] = []
-        self.model.eval()
-        with torch.no_grad():
-            for step_idx, batch in enumerate(loader):
-                if self._limit_steps(step_idx, self.config.max_eval_steps):
-                    break
-                batch_x, batch_y, batch_x_mark, batch_y_mark = self._prepare_batch(batch)
-                with self._autocast_context():
-                    outputs, target = self._run_model(batch_x, batch_y, batch_x_mark, batch_y_mark)
-                preds.append(outputs.detach().cpu().numpy())
-                trues.append(target.detach().cpu().numpy())
-        if not preds:
-            raise RuntimeError(f"No batches produced for split={split}")
-        pred_arr = np.concatenate(preds, axis=0)
-        true_arr = np.concatenate(trues, axis=0)
-        metrics = compute_metrics(pred_arr, true_arr)
-        out_dir = Path(self.config.results_dir) / self.config.setting() / split
-        out_dir.mkdir(parents=True, exist_ok=True)
-        with open(out_dir / "metrics.json", "w", encoding="utf-8") as handle:
-            json.dump(metrics, handle, indent=2)
-        if self.config.save_predictions:
-            np.save(out_dir / "pred.npy", pred_arr)
-            np.save(out_dir / "true.npy", true_arr)
-        return metrics
-
-    def run(self) -> dict[str, Any]:
-        train_summary = self.train()
-        val_metrics = self.evaluate_split("val")
-        test_metrics = self.evaluate_split("test")
-        summary = {
-            "device": str(self.device),
-            "setting": self.config.setting(),
-            "train": train_summary,
-            "val": val_metrics,
-            "test": test_metrics,
-        }
-        print(json.dumps(summary, indent=2))
-        return summary
+    pred_arr = np.concatenate(preds, axis=0)
+    true_arr = np.concatenate(trues, axis=0)
+    metrics = compute_metrics(pred_arr, true_arr)
+    out_dir = Path(config.results_dir) / config.setting / split
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(out_dir / "metrics.json", "w", encoding="utf-8") as handle:
+        json.dump(metrics, handle, indent=2)
+    if config.save_predictions:
+        np.save(out_dir / "pred.npy", pred_arr)
+        np.save(out_dir / "true.npy", true_arr)
+    return metrics
 
 
-# -----------------------------------------------------------------------------
-# Autoresearch-style experiment loop
-# -----------------------------------------------------------------------------
+def run_experiment(overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+    config = build_config(overrides)
+    device = detect_device(config.device)
+    use_amp = bool(config.use_amp and device.type == "cuda")
 
+    set_seed(config.random_seed)
+    torch.set_float32_matmul_precision("high")
 
-class PatchTSTResearcher:
-    def __init__(self, base_config: PatchTSTConfig, selection_split: str = "val") -> None:
-        if selection_split not in {"val", "test"}:
-            raise ValueError("selection_split must be 'val' or 'test'")
-        self.base_config = base_config
-        self.selection_split = selection_split
-        self.results_file = Path(base_config.results_file)
-        self.results_file.parent.mkdir(parents=True, exist_ok=True)
-        self._ensure_results_header()
+    model = PatchTSTModel(config).float().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
+    criterion = nn.MSELoss()
+    scaler = create_grad_scaler(device, use_amp)
 
-    def _ensure_results_header(self) -> None:
-        if self.results_file.exists():
-            return
-        with open(self.results_file, "w", encoding="utf-8", newline="") as handle:
-            writer = csv.writer(handle, delimiter="\t")
-            writer.writerow(["trial", "selection_mse", "test_mse", "status", "description"])
+    _, train_loader = data_provider(config, "train")
+    checkpoint_path = Path(config.checkpoints) / config.setting / "checkpoint.pth"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
-    def default_candidates(self) -> list[dict[str, Any]]:
-        return [
-            {
-                "name": "lower_dropout",
-                "overrides": {"dropout": 0.1, "fc_dropout": 0.1},
-                "description": "reduce backbone and head dropout",
-            },
-            {
-                "name": "wider_model",
-                "overrides": {"d_model": 24, "n_heads": 4, "d_ff": 96},
-                "description": "increase model width and feedforward capacity",
-            },
-            {
-                "name": "larger_patch",
-                "overrides": {"patch_len": 24, "stride": 12},
-                "description": "use larger temporal patches",
-            },
-            {
-                "name": "no_revin",
-                "overrides": {"revin": 0},
-                "description": "disable RevIN normalization",
-            },
-        ]
+    train_start = time.perf_counter()
+    history: list[dict[str, float]] = []
+    num_steps = 0
+    num_epochs = 0
+    stop_reason: str | None = None
+    current_lr = config.learning_rate
 
-    def _trial_config(self, name: str, overrides: dict[str, Any] | None = None) -> PatchTSTConfig:
-        config = apply_config_overrides(self.base_config, overrides)
-        return replace(
-            config,
-            model_id=f"{self.base_config.data}_{name}",
-            des=name,
-        )
-
-    def run_trial(
-        self,
-        name: str,
-        overrides: dict[str, Any] | None = None,
-        description: str = "",
-    ) -> TrialResult:
-        config = self._trial_config(name, overrides)
-        trainer = PatchTSTTrainer(config)
-        summary = trainer.run()
-        selection_metrics = summary[self.selection_split]
-        result = TrialResult(
-            name=name,
-            config=config.to_dict(),
-            metrics=selection_metrics,
-            test_metrics=summary["test"],
-            summary=summary,
-            description=description or name,
-        )
-        summary_path = Path(config.output_root) / "summaries" / f"{name}.json"
-        summary_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(summary_path, "w", encoding="utf-8") as handle:
-            json.dump(summary, handle, indent=2)
-        return result
-
-    def compare_trials(self, baseline: TrialResult, candidate: TrialResult) -> dict[str, Any]:
-        baseline_mse = baseline.metrics["mse"]
-        candidate_mse = candidate.metrics["mse"]
-        status = "keep" if candidate_mse < baseline_mse else "discard"
-        return {
-            "baseline": baseline.name,
-            "candidate": candidate.name,
-            "status": status,
-            "baseline_mse": baseline_mse,
-            "candidate_mse": candidate_mse,
-            "delta_mse": candidate_mse - baseline_mse,
-        }
-
-    def log_trial(self, trial: TrialResult, status: str, description: str) -> None:
-        with open(self.results_file, "a", encoding="utf-8", newline="") as handle:
-            writer = csv.writer(handle, delimiter="\t")
-            writer.writerow([
-                trial.name,
-                f"{trial.metrics['mse']:.6f}",
-                f"{trial.test_metrics['mse']:.6f}",
-                status,
-                description,
-            ])
-
-    def run_research(self, max_trials: int = 3) -> dict[str, Any]:
-        baseline = self.run_trial("baseline", description="baseline")
-        self.log_trial(baseline, "keep", "baseline")
-        best = baseline
-        decisions: list[dict[str, Any]] = []
-        for candidate_spec in self.default_candidates()[:max_trials]:
-            candidate = self.run_trial(
-                candidate_spec["name"],
-                overrides=candidate_spec["overrides"],
-                description=candidate_spec["description"],
+    while True:
+        num_epochs += 1
+        epoch_losses: list[float] = []
+        for batch in train_loader:
+            progress = 1.0 if config.train_time_budget <= 0 else min(
+                (time.perf_counter() - train_start) / config.train_time_budget,
+                1.0,
             )
-            decision = self.compare_trials(best, candidate)
-            self.log_trial(candidate, decision["status"], candidate_spec["description"])
-            decisions.append(decision)
-            if decision["status"] == "keep":
-                best = candidate
-        report = {
-            "selection_split": self.selection_split,
-            "results_file": str(self.results_file),
-            "best_trial": best.name,
-            "best_selection_mse": best.metrics["mse"],
-            "best_test_mse": best.test_metrics["mse"],
-            "decisions": decisions,
-        }
-        print(json.dumps(report, indent=2))
-        return report
+            current_lr = update_learning_rate(
+                optimizer,
+                config.learning_rate,
+                progress,
+                config.warmup_ratio,
+                config.final_lr_ratio,
+            )
+            optimizer.zero_grad(set_to_none=True)
+            batch_x, batch_y, batch_x_mark, batch_y_mark = prepare_batch(batch, device)
+            with autocast_context(device, use_amp):
+                outputs, target = run_model(model, config, batch_x, batch_y, batch_x_mark, batch_y_mark)
+                loss = criterion(outputs, target)
+            if use_amp and scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
 
+            num_steps += 1
+            epoch_losses.append(float(loss.detach().cpu().item()))
+            elapsed = time.perf_counter() - train_start
+            if config.max_train_steps is not None and num_steps >= config.max_train_steps:
+                stop_reason = "max_train_steps"
+                break
+            if num_steps >= 1 and elapsed >= config.train_time_budget:
+                stop_reason = "time_budget"
+                break
 
-# -----------------------------------------------------------------------------
-# CLI
-# -----------------------------------------------------------------------------
+        elapsed = time.perf_counter() - train_start
+        history.append(
+            {
+                "epoch": float(num_epochs),
+                "train_loss": float(np.mean(epoch_losses)) if epoch_losses else math.nan,
+                "elapsed_seconds": elapsed,
+                "num_steps": float(num_steps),
+                "learning_rate": current_lr,
+            }
+        )
+        print(
+            f"Epoch {num_epochs} | steps={num_steps} train={history[-1]['train_loss']:.6f} "
+            f"elapsed={elapsed:.2f}s lr={current_lr:.6g}"
+        )
+        if stop_reason is not None or not epoch_losses:
+            break
 
+    training_seconds = time.perf_counter() - train_start
+    torch.save(model.state_dict(), checkpoint_path)
+
+    val_metrics = evaluate_split(model, config, device, "val")
+    test_metrics = evaluate_split(model, config, device, "test")
+    total_seconds = time.perf_counter() - train_start
+
+    summary = {
+        "device": str(device),
+        "setting": config.setting,
+        "config": config_to_dict(config),
+        "train": {
+            "history": history,
+            "checkpoint_path": str(checkpoint_path),
+            "num_steps": num_steps,
+            "num_epochs": num_epochs,
+            "stop_reason": stop_reason,
+            "training_seconds": training_seconds,
+            "time_budget_seconds": config.train_time_budget,
+        },
+        "val": val_metrics,
+        "test": test_metrics,
+        "total_seconds": total_seconds,
+    }
+    print(json.dumps(summary, indent=2))
+    return summary
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Single-file PatchTST training and research")
+    parser = argparse.ArgumentParser(description="Single-file PatchTST training")
     parser.add_argument("--smoke", action="store_true", help="Run a minimal horizon-96 smoke configuration")
-    parser.add_argument("--research", action="store_true", help="Run an autoresearch-style trial loop")
-    parser.add_argument("--research-trials", type=int, default=3, help="Number of candidate trials to run")
-    parser.add_argument("--selection-split", choices=["val", "test"], default="val")
-    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
-    parser.add_argument("--data", default="ETTh1")
-    parser.add_argument("--data-path", default="ETTh1.csv")
-    parser.add_argument("--root-path", default=str(DEFAULT_DATA_ROOT))
-    parser.add_argument("--features", default="M", choices=["M", "S", "MS"])
-    parser.add_argument("--seq-len", type=int, default=336)
-    parser.add_argument("--label-len", type=int, default=48)
-    parser.add_argument("--pred-len", type=int, default=96)
-    parser.add_argument("--train-epochs", type=int, default=20)
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--learning-rate", type=float, default=1e-4)
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--max-train-steps-per-epoch", type=int)
-    parser.add_argument("--max-eval-steps", type=int)
-    parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT))
-    parser.add_argument("--model-id", default="ETTh1_336_96")
     return parser
 
 
-
-def config_from_args(args: argparse.Namespace) -> PatchTSTConfig:
-    config = PatchTSTConfig(
-        model_id=args.model_id,
-        data=args.data,
-        data_path=args.data_path,
-        root_path=args.root_path,
-        features=args.features,
-        seq_len=args.seq_len,
-        label_len=args.label_len,
-        pred_len=args.pred_len,
-        train_epochs=args.train_epochs,
-        batch_size=args.batch_size,
-        learning_rate=args.learning_rate,
-        num_workers=args.num_workers,
-        max_train_steps_per_epoch=args.max_train_steps_per_epoch,
-        max_eval_steps=args.max_eval_steps,
-        device=args.device,
-        output_root=args.output_root,
-    )
-    if args.smoke:
-        config = make_smoke_config(config)
-    return config
-
-
-
 def main(argv: list[str] | None = None) -> dict[str, Any]:
-    parser = build_arg_parser()
-    args = parser.parse_args(argv)
-    config = config_from_args(args)
-    print(json.dumps(config.to_dict(), indent=2))
-    if args.research:
-        researcher = PatchTSTResearcher(config, selection_split=args.selection_split)
-        return researcher.run_research(max_trials=args.research_trials)
-    trainer = PatchTSTTrainer(config)
-    return trainer.run()
+    args = build_arg_parser().parse_args(argv)
+    overrides = make_smoke_overrides() if args.smoke else None
+    return run_experiment(overrides=overrides)
 
 
 if __name__ == "__main__":
