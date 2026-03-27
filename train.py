@@ -1149,6 +1149,23 @@ def config_to_dict(config: SimpleNamespace) -> dict[str, Any]:
     return {key: value for key, value in vars(config).items()}
 
 
+def format_plaintext_summary(summary: dict[str, Any]) -> str:
+    lines = [
+        "---",
+        f"val_mse:          {summary['val']['mse']:.6f}",
+        f"blind_test_mse:   {summary['test']['mse']:.6f}",
+        f"training_seconds: {summary['train']['training_seconds']:.1f}",
+        f"total_seconds:    {summary['total_seconds']:.1f}",
+        f"num_steps:        {summary['train']['num_steps']}",
+        f"num_epochs:       {summary['train']['num_epochs']}",
+        f"stop_reason:      {summary['train']['stop_reason']}",
+        f"blind_test_file:  {summary['test']['source_path']}",
+    ]
+    if "summary_path" in summary:
+        lines.append(f"summary_path:     {summary['summary_path']}")
+    return "\n".join(lines)
+
+
 def make_smoke_overrides(
     output_root: str | None = None,
     train_time_budget: float = 0.01,
@@ -1364,6 +1381,13 @@ def run_experiment(overrides: dict[str, Any] | None = None) -> dict[str, Any]:
         "test": test_metrics,
         "total_seconds": total_seconds,
     }
+    summary_dir = Path(config.results_dir) / config.setting
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = summary_dir / "run_summary.txt"
+    summary["summary_path"] = str(summary_path)
+    plaintext_summary = format_plaintext_summary(summary)
+    summary_path.write_text(plaintext_summary + "\n", encoding="utf-8")
+    print(plaintext_summary)
     print(json.dumps(summary, indent=2))
     return summary
 

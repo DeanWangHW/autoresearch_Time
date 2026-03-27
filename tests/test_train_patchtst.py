@@ -56,6 +56,23 @@ class TrainEntrypointTests(unittest.TestCase):
         self.assertTrue(summary["test"]["mse"] >= 0.0)
         self.assertTrue(summary["test"]["source_path"].endswith("ETTh1_blind_test.csv"))
 
+    def test_run_experiment_writes_grep_friendly_summary_file(self):
+        train = importlib.import_module("train")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            summary = train.run_experiment(
+                overrides=train.make_smoke_overrides(
+                    output_root=tmpdir,
+                    train_time_budget=0.01,
+                )
+            )
+            summary_path = Path(summary["summary_path"])
+            self.assertTrue(summary_path.exists())
+            text = summary_path.read_text(encoding="utf-8")
+            self.assertRegex(text, r"(?m)^val_mse:\s+\d")
+            self.assertRegex(text, r"(?m)^blind_test_mse:\s+\d")
+            self.assertRegex(text, r"(?m)^training_seconds:\s+\d")
+            self.assertRegex(text, r"(?m)^blind_test_file:\s+.+ETTh1_blind_test\.csv$")
+
     def test_data_provider_routes_test_to_blind_test_file(self):
         import torch
 
