@@ -1,1 +1,34 @@
 .conda/
+.mplconfig/
+__pycache__/
+runs/
+patchtst/.mplconfig/
+patchtst/results/
+patchtst/PatchTST_supervised/checkpoints/
+patchtst/PatchTST_supervised/checkpoints_parallel/
+patchtst/PatchTST_supervised/checkpoints_verify/
+patchtst/PatchTST_supervised/results/
+patchtst/PatchTST_supervised/test_results/
+patchtst/PatchTST_supervised/result.txt
+
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+worktrees/
+results/
+queue/
+
+# Agent prompt files (generated per-session by launchers)
+CLAUDE.md
+AGENTS.md
+
+# Experimental code/artifacts
+dev/
