@@ -32,7 +32,7 @@ from torch import Tensor, optim
 from torch.utils.data import DataLoader, Dataset
 
 REPO_ROOT = Path(__file__).resolve().parent
-DEFAULT_DATA_ROOT = REPO_ROOT / "patchtst" / "dataset"
+DEFAULT_DATA_ROOT = REPO_ROOT / "dataset"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "runs" / "patchtst"
 
 MPLCONFIGDIR = REPO_ROOT / ".mplconfig"

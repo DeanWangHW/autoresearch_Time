@@ -21,12 +21,12 @@ from pathlib import Path
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-PATCHTST_ROOT = PROJECT_ROOT / "patchtst"
+DATASET_ROOT = PROJECT_ROOT / "dataset"
 TRAIN_PATH = PROJECT_ROOT / "train.py"
-ETTH1_PATH = PATCHTST_ROOT / "dataset" / "ETTh1.csv"
-ETTH2_PATH = PATCHTST_ROOT / "dataset" / "ETTh2.csv"
-ETTH1_TRAIN_PATH = PATCHTST_ROOT / "dataset" / "ETTh1_train.csv"
-ETTH1_BLIND_TEST_PATH = PATCHTST_ROOT / "dataset" / "ETTh1_blind_test.csv"
+ETTH1_PATH = DATASET_ROOT / "ETTh1.csv"
+ETTH2_PATH = DATASET_ROOT / "ETTh2.csv"
+ETTH1_TRAIN_PATH = DATASET_ROOT / "ETTh1_train.csv"
+ETTH1_BLIND_TEST_PATH = DATASET_ROOT / "ETTh1_blind_test.csv"
 ETTH1_VISIBLE_TRAIN_ROWS = 12 * 30 * 24
 
 
@@ -67,7 +67,7 @@ def check_python_environment() -> dict[str, Any]:
 
 def check_project_files() -> dict[str, Any]:
     missing = []
-    for path in [PROJECT_ROOT, PATCHTST_ROOT, TRAIN_PATH]:
+    for path in [PROJECT_ROOT, DATASET_ROOT, TRAIN_PATH]:
         if not path.exists():
             missing.append(str(path))
     if missing:
@@ -77,7 +77,7 @@ def check_project_files() -> dict[str, Any]:
         "project_files",
         project_root=str(PROJECT_ROOT),
         train_py=str(TRAIN_PATH),
-        patchtst_root=str(PATCHTST_ROOT),
+        dataset_root=str(DATASET_ROOT),
     )
 
 

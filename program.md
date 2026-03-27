@@ -7,8 +7,8 @@ The fixed task is:
 - dataset: `ETTh1`
 - horizon: `96`
 - train entrypoint: `train.py`
-- training file: `patchtst/dataset/ETTh1_train.csv`
-- blind evaluation file: `patchtst/dataset/ETTh1_blind_test.csv`
+- training file: `dataset/ETTh1_train.csv`
+- blind evaluation file: `dataset/ETTh1_blind_test.csv`
 
 ## Setup
 
@@ -16,15 +16,15 @@ To set up a new experiment, work with the user to:
 
 1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar27`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
 2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current `main`.
-3. **Verify the conda environment**: Make sure the local `patchtst` conda environment from `patchtst/environment-macos-arm64.yml` exists and is active. If not, tell the human to rebuild it.
+3. **Verify the conda environment**: Make sure the local `patchtst` conda environment from `environment-macos-arm64.yml` exists and is active. If not, tell the human to rebuild it.
 4. **Read the in-scope files**: The repo is small. Read these files for full context:
    - `README.md` — repository context.
    - `prepare.py` — fixed system check and data split preparation. Do not modify.
    - `train.py` — the file you modify. Model architecture, optimizer, training loop.
    - `program.md` — the experiment protocol you must follow.
 5. **Verify data exists**: Run `python prepare.py`. This must succeed and must verify:
-   - `patchtst/dataset/ETTh1_train.csv`
-   - `patchtst/dataset/ETTh1_blind_test.csv`
+   - `dataset/ETTh1_train.csv`
+   - `dataset/ETTh1_blind_test.csv`
 6. **Initialize results.tsv**: Create `results.tsv` with just the header row if needed. The baseline will be recorded after the first run.
 7. **Confirm and go**: Confirm setup looks good.
 
@@ -39,9 +39,10 @@ Each experiment runs on a single GPU. The training script runs for a **fixed tim
 
 **What you CANNOT do:**
 - Modify `prepare.py`. It is read-only. It contains the fixed system check and split preparation.
-- Modify `patchtst/dataset/ETTh1.csv`.
-- Modify `patchtst/dataset/ETTh1_train.csv`.
-- Modify `patchtst/dataset/ETTh1_blind_test.csv`.
+- Recreate or depend on a `patchtst/` subtree. The project is now self-contained at the repository root, and experiments must keep it that way.
+- Modify `dataset/ETTh1.csv`.
+- Modify `dataset/ETTh1_train.csv`.
+- Modify `dataset/ETTh1_blind_test.csv`.
 - Change the physical split policy.
 - Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
 - Change the task. `pred_len` must stay `96`.
@@ -69,14 +70,8 @@ total_seconds:    303.3
 num_steps:        1753
 num_epochs:       36
 stop_reason:      time_budget
-blind_test_file:  /abs/path/patchtst/dataset/ETTh1_blind_test.csv
+blind_test_file:  /abs/path/dataset/ETTh1_blind_test.csv
 summary_path:     /abs/path/runs/patchtst/.../run_summary.txt
-```
-
-Note that the script is configured to always stop after 5 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metrics from the log file with:
-
-```bash
-grep "^val_mse:\|^blind_test_mse:\|^training_seconds:\|^summary_path:" run.log
 ```
 
 The same summary is also written to `run_summary.txt` inside the run result directory, so you can inspect it even if you did not redirect stdout.
@@ -85,7 +80,16 @@ The most important checks are:
 
 - `val_mse`
 - `blind_test_mse`
-- `blind_test_file` must end with `ETTh1_blind_test.csv`
+- `blind_test_file` must end with `dataset/ETTh1_blind_test.csv`
+- `summary_path` should point at the run directory summary file
+- `stop_reason` should usually be `time_budget`
+ 
+Note that the script is configured to always stop after 5 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metrics from the log file with:
+
+```bash
+grep "^val_mse:\|^blind_test_mse:\|^training_seconds:\|^summary_path:" run.log
+```
+
 
 ## Logging results
 
