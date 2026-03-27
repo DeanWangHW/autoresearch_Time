@@ -1,403 +1,245 @@
-"""
-One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+"""System self-check entrypoint for the local PatchTST autoresearch project.
 
 Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
-
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+    python prepare.py          # full system check, includes horizon-96 smoke run
+    python prepare.py --quick  # fast check, skip smoke training
 """
 
-import os
-import sys
-import time
-import math
+from __future__ import annotations
+
 import argparse
-import pickle
-from multiprocessing import Pool
+import csv
+import importlib
+import io
+import os
+import platform
+import sys
+import tempfile
+import traceback
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+from typing import Any
 
-import requests
-import pyarrow.parquet as pq
-import rustbpe
-import tiktoken
-import torch
-
-def verify_macos_env():
-    import sys
-    if sys.platform != "darwin":
-        raise RuntimeError(f"This script requires macOS with Metal. Detected platform: {sys.platform}")
-    if not torch.backends.mps.is_available():
-        raise RuntimeError("MPS (Metal Performance Shaders) is not available. Ensure you are running on Apple Silicon with a compatible PyTorch build.")
-    print("Environment verified: macOS detected with Metal (MPS) hardware acceleration available.")
-    print()
-
-verify_macos_env()
-
-# ---------------------------------------------------------------------------
-# Constants (fixed, do not modify)
-# ---------------------------------------------------------------------------
-
-MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
-
-# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
-
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
-
-# ---------------------------------------------------------------------------
-# Data download
-# ---------------------------------------------------------------------------
-
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
-        return True
-
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
-    return False
+PROJECT_ROOT = Path(__file__).resolve().parent
+PATCHTST_ROOT = PROJECT_ROOT / "patchtst"
+TRAIN_PATH = PROJECT_ROOT / "train.py"
+ETTH1_PATH = PATCHTST_ROOT / "dataset" / "ETTh1.csv"
+ETTH2_PATH = PATCHTST_ROOT / "dataset" / "ETTh2.csv"
 
 
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
-
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
-        return
-
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
-
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
-
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
-
-# ---------------------------------------------------------------------------
-# Tokenizer training
-# ---------------------------------------------------------------------------
-
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
+def _pass(name: str, **details: Any) -> dict[str, Any]:
+    return {"name": name, "status": "pass", "details": details}
 
 
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
-    nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
+def _fail(name: str, exc: BaseException) -> dict[str, Any]:
+    return {
+        "name": name,
+        "status": "fail",
+        "details": {
+            "error": str(exc),
+            "exception_type": type(exc).__name__,
+            "traceback": traceback.format_exc(limit=6).strip(),
+        },
+    }
 
 
-def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
-    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
+def check_python_environment() -> dict[str, Any]:
+    import torch
 
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
-        return
+    version = sys.version_info
+    if version < (3, 10):
+        raise RuntimeError(f"Python 3.10+ required, got {platform.python_version()}")
 
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
-
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
-        sys.exit(1)
-
-    # --- Train with rustbpe ---
-    print("Tokenizer: training BPE tokenizer...")
-    t0 = time.time()
-
-    tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
-
-    # Build tiktoken encoding from trained merges
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
+    return _pass(
+        "python_environment",
+        python=platform.python_version(),
+        executable=sys.executable,
+        platform=platform.platform(),
+        torch_version=torch.__version__,
+        cuda_available=torch.cuda.is_available(),
+        mps_available=bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()),
+        cwd=str(PROJECT_ROOT),
     )
 
-    # Save tokenizer
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
 
-    t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
+def check_project_files() -> dict[str, Any]:
+    missing = []
+    for path in [PROJECT_ROOT, PATCHTST_ROOT, TRAIN_PATH]:
+        if not path.exists():
+            missing.append(str(path))
+    if missing:
+        raise FileNotFoundError(f"Missing required project paths: {missing}")
 
-    # --- Build token_bytes lookup for BPB evaluation ---
-    print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
-        if token_str in special_set:
-            token_bytes_list.append(0)
+    return _pass(
+        "project_files",
+        project_root=str(PROJECT_ROOT),
+        train_py=str(TRAIN_PATH),
+        patchtst_root=str(PATCHTST_ROOT),
+    )
+
+
+def _read_csv_preview(path: Path, rows: int = 2) -> tuple[list[str], list[list[str]]]:
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.reader(handle)
+        header = next(reader)
+        preview = []
+        for _ in range(rows):
+            try:
+                preview.append(next(reader))
+            except StopIteration:
+                break
+    return header, preview
+
+
+def check_etth1_dataset() -> dict[str, Any]:
+    if not ETTH1_PATH.exists():
+        raise FileNotFoundError(f"ETTh1 dataset not found: {ETTH1_PATH}")
+
+    header, preview = _read_csv_preview(ETTH1_PATH)
+    if not header:
+        raise RuntimeError("ETTh1.csv is empty")
+    if "date" not in header or "OT" not in header:
+        raise RuntimeError(f"Unexpected ETTh1 columns: {header}")
+
+    return _pass(
+        "dataset_etth1",
+        path=str(ETTH1_PATH),
+        size_bytes=ETTH1_PATH.stat().st_size,
+        columns=header,
+        preview_rows=preview,
+        etth2_present=ETTH2_PATH.exists(),
+    )
+
+
+def check_train_module_import() -> tuple[dict[str, Any], Any]:
+    train = importlib.import_module("train")
+    required = [
+        "PatchTSTConfig",
+        "PatchTSTTrainer",
+        "PatchTSTResearcher",
+        "make_smoke_config",
+    ]
+    missing = [name for name in required if not hasattr(train, name)]
+    if missing:
+        raise RuntimeError(f"train.py missing required symbols: {missing}")
+
+    return (
+        _pass(
+            "train_module_import",
+            module_path=getattr(train, "__file__", str(TRAIN_PATH)),
+            required_symbols=required,
+        ),
+        train,
+    )
+
+
+def run_patchtst_horizon96_smoke(train_module: Any) -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="patchtst-smoke-") as tmpdir:
+        config = train_module.make_smoke_config(
+            train_module.PatchTSTConfig(
+                output_root=tmpdir,
+                num_workers=0,
+                save_predictions=False,
+            )
+        )
+        if config.pred_len != 96:
+            raise RuntimeError(f"Smoke config pred_len must be 96, got {config.pred_len}")
+
+        log_buffer = io.StringIO()
+        with redirect_stdout(log_buffer), redirect_stderr(log_buffer):
+            summary = train_module.PatchTSTTrainer(config).run()
+
+    return _pass(
+        "patchtst_horizon96_smoke",
+        pred_len=config.pred_len,
+        device=summary["device"],
+        output_root=tmpdir,
+        train_epochs=len(summary["train"]["history"]),
+        val_metrics=summary["val"],
+        test_metrics=summary["test"],
+        log_tail=log_buffer.getvalue().strip().splitlines()[-12:],
+    )
+
+
+def run_system_check(run_smoke: bool = True) -> dict[str, Any]:
+    checks: list[dict[str, Any]] = []
+    train_module = None
+
+    for check_fn in [check_python_environment, check_project_files, check_etth1_dataset]:
+        try:
+            checks.append(check_fn())
+        except Exception as exc:  # noqa: BLE001
+            checks.append(_fail(check_fn.__name__.replace("check_", ""), exc))
+
+    try:
+        train_result, train_module = check_train_module_import()
+        checks.append(train_result)
+    except Exception as exc:  # noqa: BLE001
+        checks.append(_fail("train_module_import", exc))
+
+    if run_smoke:
+        if train_module is None:
+            checks.append(
+                {
+                    "name": "patchtst_horizon96_smoke",
+                    "status": "fail",
+                    "details": {"error": "Skipped because train.py import failed."},
+                }
+            )
         else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
+            try:
+                checks.append(run_patchtst_horizon96_smoke(train_module))
+            except Exception as exc:  # noqa: BLE001
+                checks.append(_fail("patchtst_horizon96_smoke", exc))
 
-    # Sanity check
-    test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
+    ok = all(item["status"] == "pass" for item in checks)
+    return {
+        "ok": ok,
+        "project_root": str(PROJECT_ROOT),
+        "checks": checks,
+    }
 
-# ---------------------------------------------------------------------------
-# Runtime utilities (imported by train.py)
-# ---------------------------------------------------------------------------
 
-class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
-
-    def __init__(self, enc):
-        self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
-
-    @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc)
-
-    def get_vocab_size(self):
-        return self.enc.n_vocab
-
-    def get_bos_token_id(self):
-        return self.bos_token_id
-
-    def encode(self, text, prepend=None, num_threads=8):
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
-        if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
-                ids.insert(0, prepend_id)
-        elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
-                for row in ids:
-                    row.insert(0, prepend_id)
+def format_report(report: dict[str, Any]) -> str:
+    lines = [
+        f"Project root: {report['project_root']}",
+        "System check:",
+    ]
+    for item in report["checks"]:
+        label = "PASS" if item["status"] == "pass" else "FAIL"
+        lines.append(f"- [{label}] {item['name']}")
+        details = item.get("details", {})
+        if item["status"] == "pass":
+            if item["name"] == "python_environment":
+                lines.append(
+                    f"  python={details['python']} torch={details['torch_version']} "
+                    f"cuda={details['cuda_available']} mps={details['mps_available']}"
+                )
+            elif item["name"] == "dataset_etth1":
+                lines.append(f"  dataset={details['path']} size={details['size_bytes']} bytes")
+            elif item["name"] == "patchtst_horizon96_smoke":
+                mse = details["test_metrics"]["mse"]
+                lines.append(
+                    f"  pred_len={details['pred_len']} device={details['device']} test_mse={mse:.6f}"
+                )
         else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-        return ids
-
-    def decode(self, ids):
-        return self.enc.decode(ids)
+            lines.append(f"  error={details.get('error', 'unknown error')}")
+    lines.append(f"Overall: {'PASS' if report['ok'] else 'FAIL'}")
+    return "\n".join(lines)
 
 
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="PatchTST project system self-check")
+    parser.add_argument("--quick", action="store_true", help="Skip the horizon-96 smoke run")
+    return parser
 
 
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-    else:
-        parquet_paths = [val_path]
-    epoch = 1
-    while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
-        epoch += 1
+def main(argv: list[str] | None = None) -> int:
+    args = build_arg_parser().parse_args(argv)
+    report = run_system_check(run_smoke=not args.quick)
+    print(format_report(report))
+    return 0 if report["ok"] else 1
 
-
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
-    """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
-    """
-    assert split in ["train", "val"]
-    row_capacity = T + 1
-    batches = _document_batches(split)
-    bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
-    epoch = 1
-
-    def refill_buffer():
-        nonlocal epoch
-        doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
-        doc_buffer.extend(token_lists)
-
-    # Detect device
-    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=(device=="cuda"))
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device)
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
-
-    while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
-
-                remaining = row_capacity - pos
-
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
-
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
-                    pos += len(doc)
-                else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
-
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        yield inputs, targets, epoch
-
-# ---------------------------------------------------------------------------
-# Evaluation (DO NOT CHANGE — this is the fixed metric)
-# ---------------------------------------------------------------------------
-
-@torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
-    """
-    Bits per byte (BPB): vocab size-independent evaluation metric.
-    Sums per-token cross-entropy (in nats), sums target byte lengths,
-    then converts nats/byte to bits/byte. Special tokens (byte length 0)
-    are excluded from both sums.
-    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
-    """
-    device = next(model.parameters()).device
-    token_bytes = get_token_bytes(device=device)
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
-    total_nats = 0.0
-    total_bytes = 0
-    for _ in range(steps):
-        x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
-        mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
-    return total_nats / (math.log(2) * total_bytes)
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
-    args = parser.parse_args()
-
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
-
-    print(f"Cache directory: {CACHE_DIR}")
-    print()
-
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
-    print()
-
-    # Step 2: Train tokenizer
-    train_tokenizer()
-    print()
-    print("Done! Ready to train.")
+    raise SystemExit(main())
