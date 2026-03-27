@@ -32,7 +32,7 @@ Once you get confirmation, kick off the experimentation.
 
 ## Experimentation
 
-Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time). With the `patchtst` environment active, you launch it simply as: `python train.py`.
+Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 10 minutes** (wall clock training time). With the `patchtst` environment active, you launch it simply as: `python train.py`.
 
 **What you CAN do:**
 - Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, patch settings, etc.
@@ -46,8 +46,9 @@ Each experiment runs on a single GPU. The training script runs for a **fixed tim
 - Change the physical split policy.
 - Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
 - Change the task. `pred_len` must stay `96`.
+- Reintroduce checkpoint writes. Runs should keep writing summaries and metrics, but must not persist `checkpoint.pth` files.
 
-**The goal is simple: get the lowest val_mse.** Since the time budget is fixed, you do not need to worry about training time — it is always 5 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
+**The goal is simple: get the lowest val_mse.** Since the time budget is fixed, you do not need to worry about training time — it is always 10 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
 
 **Blind test rule**: `blind_test_mse` is recorded for transparency, but it is **not** the branch-advance metric. The branch advances only on `val_mse`. Do not optimize directly against the blind test file.
 
@@ -65,8 +66,8 @@ Once the script finishes it prints a summary like this:
 ---
 val_mse:          0.405305
 blind_test_mse:   0.431455
-training_seconds: 300.0
-total_seconds:    303.3
+training_seconds: 600.0
+total_seconds:    603.3
 num_steps:        1753
 num_epochs:       36
 stop_reason:      time_budget
@@ -84,7 +85,7 @@ The most important checks are:
 - `summary_path` should point at the run directory summary file
 - `stop_reason` should usually be `time_budget`
  
-Note that the script is configured to always stop after 5 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metrics from the log file with:
+Note that the script is configured to always stop after 10 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metrics from the log file with:
 
 ```bash
 grep "^val_mse:\|^blind_test_mse:\|^training_seconds:\|^summary_path:" run.log
@@ -137,10 +138,10 @@ The idea is that you are a completely autonomous researcher trying things out. I
 
 **Important**: `blind_test_mse` is not the keep/discard metric. It is only logged. This is deliberate so the blind test remains more trustworthy.
 
-**Timeout**: Each experiment should take about 5 minutes total (+ a bit for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
+**Timeout**: Each experiment should take about 10 minutes total (+ a bit for startup and eval overhead). If a run exceeds 15 minutes, kill it and treat it as a failure (discard and revert).
 
 **Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it is something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log `crash` as the status in the tsv, and move on.
 
 **NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or away from the computer and expects you to continue working *indefinitely* until manually stopped. You are autonomous. If you run out of ideas, think harder — re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
 
-As an example use case, a user might leave you running while they sleep. If each experiment takes about 5 minutes then you can run around 12 per hour, for a total of around 100 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept.
+As an example use case, a user might leave you running while they sleep. If each experiment takes about 10 minutes then you can run around 6 per hour, for a total of around 50 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept.

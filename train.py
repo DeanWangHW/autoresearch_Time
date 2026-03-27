@@ -85,7 +85,7 @@ INDIVIDUAL = 0
 RANDOM_SEED = 2021
 BATCH_SIZE = 128
 LEARNING_RATE = 1e-4
-TRAIN_TIME_BUDGET = 300.0
+TRAIN_TIME_BUDGET = 600.0
 WARMUP_RATIO = 0.0
 FINAL_LR_RATIO = 1.0
 DEVICE = "auto"
@@ -1138,7 +1138,6 @@ def build_config(overrides: dict[str, Any] | None = None) -> SimpleNamespace:
     if config["features"] == "S":
         config["enc_in"] = config["dec_in"] = config["c_out"] = 1
     config["output_root"] = str(config["output_root"])
-    config["checkpoints"] = str(Path(config["output_root"]) / "checkpoints")
     config["results_dir"] = str(Path(config["output_root"]) / "results")
     namespace = SimpleNamespace(**config)
     namespace.setting = build_setting(namespace)
@@ -1292,9 +1291,6 @@ def run_experiment(overrides: dict[str, Any] | None = None) -> dict[str, Any]:
     scaler = create_grad_scaler(device, use_amp)
 
     _, train_loader = data_provider(config, "train")
-    checkpoint_path = Path(config.checkpoints) / config.setting / "checkpoint.pth"
-    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-
     train_start = time.perf_counter()
     history: list[dict[str, float]] = []
     num_steps = 0
@@ -1358,7 +1354,6 @@ def run_experiment(overrides: dict[str, Any] | None = None) -> dict[str, Any]:
             break
 
     training_seconds = time.perf_counter() - train_start
-    torch.save(model.state_dict(), checkpoint_path)
 
     val_metrics = evaluate_split(model, config, device, "val")
     test_metrics = evaluate_split(model, config, device, "test")
@@ -1370,7 +1365,6 @@ def run_experiment(overrides: dict[str, Any] | None = None) -> dict[str, Any]:
         "config": config_to_dict(config),
         "train": {
             "history": history,
-            "checkpoint_path": str(checkpoint_path),
             "num_steps": num_steps,
             "num_epochs": num_epochs,
             "stop_reason": stop_reason,
