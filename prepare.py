@@ -25,6 +25,9 @@ PATCHTST_ROOT = PROJECT_ROOT / "patchtst"
 TRAIN_PATH = PROJECT_ROOT / "train.py"
 ETTH1_PATH = PATCHTST_ROOT / "dataset" / "ETTh1.csv"
 ETTH2_PATH = PATCHTST_ROOT / "dataset" / "ETTh2.csv"
+ETTH1_TRAIN_PATH = PATCHTST_ROOT / "dataset" / "ETTh1_train.csv"
+ETTH1_BLIND_TEST_PATH = PATCHTST_ROOT / "dataset" / "ETTh1_blind_test.csv"
+ETTH1_VISIBLE_TRAIN_ROWS = 12 * 30 * 24
 
 
 def _pass(name: str, **details: Any) -> dict[str, Any]:
@@ -91,6 +94,45 @@ def _read_csv_preview(path: Path, rows: int = 2) -> tuple[list[str], list[list[s
     return header, preview
 
 
+def _write_csv(path: Path, header: list[str], rows: list[list[str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(header)
+        writer.writerows(rows)
+
+
+def ensure_etth1_split() -> dict[str, Any]:
+    if not ETTH1_PATH.exists():
+        raise FileNotFoundError(f"ETTh1 dataset not found: {ETTH1_PATH}")
+
+    with ETTH1_PATH.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.reader(handle)
+        header = next(reader)
+        rows = list(reader)
+
+    if len(rows) <= ETTH1_VISIBLE_TRAIN_ROWS:
+        raise RuntimeError(
+            f"ETTh1.csv must contain more than {ETTH1_VISIBLE_TRAIN_ROWS} rows, got {len(rows)}"
+        )
+
+    train_rows = rows[:ETTH1_VISIBLE_TRAIN_ROWS]
+    blind_test_rows = rows[ETTH1_VISIBLE_TRAIN_ROWS:]
+    _write_csv(ETTH1_TRAIN_PATH, header, train_rows)
+    _write_csv(ETTH1_BLIND_TEST_PATH, header, blind_test_rows)
+
+    return {
+        "train_path": str(ETTH1_TRAIN_PATH),
+        "blind_test_path": str(ETTH1_BLIND_TEST_PATH),
+        "train_rows": len(train_rows),
+        "blind_test_rows": len(blind_test_rows),
+        "train_first_date": train_rows[0][0],
+        "train_last_date": train_rows[-1][0],
+        "blind_test_first_date": blind_test_rows[0][0],
+        "blind_test_last_date": blind_test_rows[-1][0],
+    }
+
+
 def check_etth1_dataset() -> dict[str, Any]:
     if not ETTH1_PATH.exists():
         raise FileNotFoundError(f"ETTh1 dataset not found: {ETTH1_PATH}")
@@ -111,11 +153,18 @@ def check_etth1_dataset() -> dict[str, Any]:
     )
 
 
+def check_etth1_split() -> dict[str, Any]:
+    split = ensure_etth1_split()
+    return _pass("dataset_etth1_split", **split)
+
+
 def check_train_module_import() -> tuple[dict[str, Any], Any]:
     train = importlib.import_module("train")
     required = [
         "PRED_LEN",
         "TRAIN_TIME_BUDGET",
+        "TRAIN_DATA_PATH",
+        "BLIND_TEST_DATA_PATH",
         "build_config",
         "make_smoke_overrides",
         "run_experiment",
@@ -156,6 +205,8 @@ def run_patchtst_horizon96_smoke(train_module: Any) -> dict[str, Any]:
         num_steps=summary["train"]["num_steps"],
         stop_reason=summary["train"]["stop_reason"],
         training_seconds=summary["train"]["training_seconds"],
+        train_data_path=summary["config"]["train_data_path"],
+        blind_test_path=summary["test"]["source_path"],
         val_metrics=summary["val"],
         test_metrics=summary["test"],
         log_tail=log_buffer.getvalue().strip().splitlines()[-12:],
@@ -166,7 +217,7 @@ def run_system_check(run_smoke: bool = True) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
     train_module = None
 
-    for check_fn in [check_python_environment, check_project_files, check_etth1_dataset]:
+    for check_fn in [check_python_environment, check_project_files, check_etth1_dataset, check_etth1_split]:
         try:
             checks.append(check_fn())
         except Exception as exc:  # noqa: BLE001
@@ -218,6 +269,11 @@ def format_report(report: dict[str, Any]) -> str:
                 )
             elif item["name"] == "dataset_etth1":
                 lines.append(f"  dataset={details['path']} size={details['size_bytes']} bytes")
+            elif item["name"] == "dataset_etth1_split":
+                lines.append(
+                    f"  train={details['train_path']} rows={details['train_rows']} "
+                    f"blind_test={details['blind_test_path']} rows={details['blind_test_rows']}"
+                )
             elif item["name"] == "patchtst_horizon96_smoke":
                 mse = details["test_metrics"]["mse"]
                 lines.append(

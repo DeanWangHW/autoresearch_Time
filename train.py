@@ -9,6 +9,7 @@ selection metric. The default task is ETTh1 with horizon 96.
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import math
 import os
@@ -48,7 +49,9 @@ MODEL = "PatchTST"
 MODEL_ID = "ETTh1_336_96"
 DATA = "ETTh1"
 ROOT_PATH = str(DEFAULT_DATA_ROOT)
-DATA_PATH = "ETTh1.csv"
+TRAIN_DATA_PATH = "ETTh1_train.csv"
+BLIND_TEST_DATA_PATH = "ETTh1_blind_test.csv"
+DATA_PATH = TRAIN_DATA_PATH
 FEATURES = "M"
 TARGET = "OT"
 FREQ = "h"
@@ -90,6 +93,7 @@ USE_AMP = False
 NUM_WORKERS = 0
 MAX_TRAIN_STEPS = None
 MAX_EVAL_STEPS = None
+TRAIN_VAL_RATIO = 0.8
 
 # Runtime
 OUTPUT_ROOT = str(DEFAULT_OUTPUT_ROOT)
@@ -239,6 +243,8 @@ class BaseETTDataset(Dataset):
         scale: bool,
         timeenc: int,
         freq: str,
+        split_mode: str = "standard",
+        train_val_ratio: float = 0.8,
     ) -> None:
         assert flag in {"train", "val", "test"}
         self.seq_len, self.label_len, self.pred_len = size
@@ -249,6 +255,9 @@ class BaseETTDataset(Dataset):
         self.freq = freq
         self.root_path = root_path
         self.data_path = data_path
+        self.source_path = str(Path(self.root_path) / self.data_path)
+        self.split_mode = split_mode
+        self.train_val_ratio = train_val_ratio
         self.set_type = {"train": 0, "val": 1, "test": 2}[flag]
         self.scaler = StandardScaler()
         self.data_x: np.ndarray
@@ -261,6 +270,29 @@ class BaseETTDataset(Dataset):
 
     def _borders(self, df_raw: pd.DataFrame) -> tuple[list[int], list[int]]:
         raise NotImplementedError
+
+    def _train_val_file_borders(self, df_raw: pd.DataFrame) -> tuple[list[int], list[int]]:
+        num_rows = len(df_raw)
+        min_train_rows = self.seq_len + self.pred_len + 1
+        min_val_rows = self.pred_len + 1
+        split_index = int(num_rows * self.train_val_ratio)
+        split_index = max(split_index, min_train_rows)
+        split_index = min(split_index, num_rows - min_val_rows)
+        if split_index <= self.seq_len or split_index >= num_rows:
+            raise ValueError(
+                f"Training split is too small for seq_len={self.seq_len}, pred_len={self.pred_len}, rows={num_rows}"
+            )
+        border1s = [0, max(split_index - self.seq_len, 0), max(split_index - self.seq_len, 0)]
+        border2s = [split_index, num_rows, num_rows]
+        return border1s, border2s
+
+    def _full_file_borders(self, df_raw: pd.DataFrame) -> tuple[list[int], list[int]]:
+        num_rows = len(df_raw)
+        if num_rows <= self.seq_len + self.pred_len:
+            raise ValueError(
+                f"Blind test file is too small for seq_len={self.seq_len}, pred_len={self.pred_len}, rows={num_rows}"
+            )
+        return [0, 0, 0], [num_rows, num_rows, num_rows]
 
     def _read_data(self) -> None:
         df_raw = self._read_csv()
@@ -318,6 +350,10 @@ class BaseETTDataset(Dataset):
 
 class DatasetETTHour(BaseETTDataset):
     def _borders(self, df_raw: pd.DataFrame) -> tuple[list[int], list[int]]:
+        if self.split_mode == "train_only":
+            return self._train_val_file_borders(df_raw)
+        if self.split_mode == "blind_test":
+            return self._full_file_borders(df_raw)
         border1s = [0, 12 * 30 * 24 - self.seq_len, 12 * 30 * 24 + 4 * 30 * 24 - self.seq_len]
         border2s = [12 * 30 * 24, 12 * 30 * 24 + 4 * 30 * 24, 12 * 30 * 24 + 8 * 30 * 24]
         return border1s, border2s
@@ -325,6 +361,10 @@ class DatasetETTHour(BaseETTDataset):
 
 class DatasetETTMinute(BaseETTDataset):
     def _borders(self, df_raw: pd.DataFrame) -> tuple[list[int], list[int]]:
+        if self.split_mode == "train_only":
+            return self._train_val_file_borders(df_raw)
+        if self.split_mode == "blind_test":
+            return self._full_file_borders(df_raw)
         border1s = [
             0,
             12 * 30 * 24 * 4 - self.seq_len,
@@ -340,6 +380,10 @@ class DatasetETTMinute(BaseETTDataset):
 
 class DatasetCustom(BaseETTDataset):
     def _borders(self, df_raw: pd.DataFrame) -> tuple[list[int], list[int]]:
+        if self.split_mode == "train_only":
+            return self._train_val_file_borders(df_raw)
+        if self.split_mode == "blind_test":
+            return self._full_file_borders(df_raw)
         cols = list(df_raw.columns)
         cols.remove(self.target)
         cols.remove("date")
@@ -365,16 +409,20 @@ DATASET_MAP = {
 def data_provider(config: SimpleNamespace | Any, flag: str) -> tuple[Dataset, DataLoader]:
     data_cls = DATASET_MAP[config.data]
     timeenc = 1 if config.embed == "timeF" else 0
+    data_path = config.train_data_path
+    split_mode = "train_only"
     if flag == "test":
         shuffle = False
         drop_last = True
+        data_path = config.blind_test_data_path
+        split_mode = "blind_test"
     else:
         shuffle = True
         drop_last = True
 
-    dataset = data_cls(
+    dataset_kwargs = dict(
         root_path=config.root_path,
-        data_path=config.data_path,
+        data_path=data_path,
         flag=flag,
         size=[config.seq_len, config.label_len, config.pred_len],
         features=config.features,
@@ -383,6 +431,12 @@ def data_provider(config: SimpleNamespace | Any, flag: str) -> tuple[Dataset, Da
         timeenc=timeenc,
         freq=config.freq,
     )
+    signature = inspect.signature(data_cls)
+    if "split_mode" in signature.parameters:
+        dataset_kwargs["split_mode"] = split_mode
+    if "train_val_ratio" in signature.parameters:
+        dataset_kwargs["train_val_ratio"] = config.train_val_ratio
+    dataset = data_cls(**dataset_kwargs)
     print(flag, len(dataset))
     loader = DataLoader(
         dataset,
@@ -1025,6 +1079,8 @@ def build_config(overrides: dict[str, Any] | None = None) -> SimpleNamespace:
         "data": DATA,
         "root_path": str(ROOT_PATH),
         "data_path": DATA_PATH,
+        "train_data_path": TRAIN_DATA_PATH,
+        "blind_test_data_path": BLIND_TEST_DATA_PATH,
         "features": FEATURES,
         "target": TARGET,
         "freq": FREQ,
@@ -1059,6 +1115,7 @@ def build_config(overrides: dict[str, Any] | None = None) -> SimpleNamespace:
         "num_workers": NUM_WORKERS,
         "max_train_steps": MAX_TRAIN_STEPS,
         "max_eval_steps": MAX_EVAL_STEPS,
+        "train_val_ratio": float(TRAIN_VAL_RATIO),
         "output_root": str(OUTPUT_ROOT),
         "save_predictions": SAVE_PREDICTIONS,
         "enc_in": 7,
@@ -1070,6 +1127,9 @@ def build_config(overrides: dict[str, Any] | None = None) -> SimpleNamespace:
         if unknown:
             raise KeyError(f"Unknown config override(s): {unknown}")
         config.update(overrides)
+    if overrides and "data_path" in overrides and "train_data_path" not in overrides:
+        config["train_data_path"] = config["data_path"]
+    config["data_path"] = config["train_data_path"]
 
     if config["model"] != "PatchTST":
         raise ValueError("This entrypoint only supports PatchTST.")
@@ -1169,7 +1229,7 @@ def update_learning_rate(optimizer: optim.Optimizer, base_lr: float, progress: f
 
 
 def evaluate_split(model: PatchTSTModel, config: SimpleNamespace, device: torch.device, split: str) -> dict[str, float]:
-    _, loader = data_provider(config, split)
+    dataset, loader = data_provider(config, split)
     preds: list[np.ndarray] = []
     trues: list[np.ndarray] = []
     model.eval()
@@ -1189,6 +1249,8 @@ def evaluate_split(model: PatchTSTModel, config: SimpleNamespace, device: torch.
     pred_arr = np.concatenate(preds, axis=0)
     true_arr = np.concatenate(trues, axis=0)
     metrics = compute_metrics(pred_arr, true_arr)
+    metrics["source_path"] = getattr(dataset, "source_path", "")
+    metrics["num_windows"] = float(len(dataset))
     out_dir = Path(config.results_dir) / config.setting / split
     out_dir.mkdir(parents=True, exist_ok=True)
     with open(out_dir / "metrics.json", "w", encoding="utf-8") as handle:

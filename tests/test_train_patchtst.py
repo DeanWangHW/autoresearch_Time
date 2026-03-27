@@ -19,12 +19,16 @@ class TrainEntrypointTests(unittest.TestCase):
             "LEARNING_RATE",
             "BATCH_SIZE",
             "DEVICE",
+            "TRAIN_DATA_PATH",
+            "BLIND_TEST_DATA_PATH",
             "build_config",
             "make_smoke_overrides",
             "run_experiment",
         ]:
             self.assertTrue(hasattr(module, name), name)
         self.assertEqual(module.PRED_LEN, 96)
+        self.assertEqual(module.TRAIN_DATA_PATH, "ETTh1_train.csv")
+        self.assertEqual(module.BLIND_TEST_DATA_PATH, "ETTh1_blind_test.csv")
 
     def test_train_py_removes_trainer_and_researcher_wrappers(self):
         source = TRAIN_PATH.read_text(encoding="utf-8")
@@ -50,6 +54,70 @@ class TrainEntrypointTests(unittest.TestCase):
         self.assertEqual(summary["config"]["pred_len"], 96)
         self.assertIn("mse", summary["test"])
         self.assertTrue(summary["test"]["mse"] >= 0.0)
+        self.assertTrue(summary["test"]["source_path"].endswith("ETTh1_blind_test.csv"))
+
+    def test_data_provider_routes_test_to_blind_test_file(self):
+        import torch
+
+        train = importlib.import_module("train")
+        calls: list[tuple[str, str]] = []
+
+        class FakeDataset:
+            def __init__(
+                self,
+                root_path,
+                data_path,
+                flag,
+                size,
+                features,
+                target,
+                scale,
+                timeenc,
+                freq,
+            ):
+                del root_path, size, features, target, scale, timeenc, freq
+                calls.append((flag, data_path))
+
+            def __len__(self):
+                return 1
+
+            def __getitem__(self, _index):
+                return (
+                    torch.zeros(1, 1),
+                    torch.zeros(1, 1),
+                    torch.zeros(1, 1),
+                    torch.zeros(1, 1),
+                )
+
+        config = train.build_config(
+            {
+                "data": "fake_split",
+                "train_data_path": "train-only.csv",
+                "blind_test_data_path": "blind-only.csv",
+                "batch_size": 1,
+            }
+        )
+
+        original = train.DATASET_MAP.get("fake_split")
+        train.DATASET_MAP["fake_split"] = FakeDataset
+        try:
+            train.data_provider(config, "train")
+            train.data_provider(config, "val")
+            train.data_provider(config, "test")
+        finally:
+            if original is None:
+                del train.DATASET_MAP["fake_split"]
+            else:
+                train.DATASET_MAP["fake_split"] = original
+
+        self.assertEqual(
+            calls,
+            [
+                ("train", "train-only.csv"),
+                ("val", "train-only.csv"),
+                ("test", "blind-only.csv"),
+            ],
+        )
 
     def test_training_does_not_stop_before_time_budget_is_hit(self):
         import torch
@@ -78,8 +146,14 @@ class TrainEntrypointTests(unittest.TestCase):
             10.5,
         ])
 
+        class FakeDataset:
+            source_path = "mock.csv"
+
+            def __len__(self):
+                return 1
+
         def fake_data_provider(*_args, **_kwargs):
-            return None, [batch]
+            return FakeDataset(), [batch]
 
         with tempfile.TemporaryDirectory() as tmpdir:
             overrides["output_root"] = tmpdir
