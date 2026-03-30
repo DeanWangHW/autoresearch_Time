@@ -1,0 +1,56 @@
+commit	val_mse	blind_test_mse	status	description
+7b18afb	0.461390	0.541664	keep	unmodified baseline on autoresearch/mar27
+0b1647d	0.451864	0.526603	keep	increase learning rate to 2e-4
+75d504a	0.440736	0.496336	keep	increase learning rate to 3e-4 with warmup and linear decay
+bdca636	0.451292	0.510635	discard	lower dropout and fc_dropout to 0.1
+2078e80	0.438972	0.500960	keep	set dropout and fc_dropout to 0.2
+fd1a5f2	0.433345	0.476406	keep	use 24-hour patches with stride 12
+9b166c0	0.555544	0.588029	discard	widen model to d_model 32 d_ff 256 with batch 96
+a9cdfff	0.501122	0.552442	discard	enable RevIN affine parameters
+8e955ab	0.544878	0.513299	discard	normalize relative to last observed value
+28347dc	0.585005	0.592282	discard	use shorter patches 12 with stride 6
+369e99c	0.512595	0.566490	discard	fuse time features into input
+bf45c54	0.557927	0.563027	discard	increase context to 512 and label_len to 96 with batch 96
+359f5b0	0.511398	0.519473	discard	use longer patches 32 with stride 16
+a13511e	0.550465	0.578498	discard	use per-channel prediction heads
+035376b	0.492371	0.553962	discard	increase overlap with patch_len 24 stride 8
+c360804	0.500244	0.526610	discard	reduce overlap with patch_len 24 stride 16
+d8cd934	0.524514	0.533724	discard	use 2 encoder layers
+101a291	0.495722	0.541963	discard	switch optimizer to AdamW with weight decay 1e-4
+b17fb39	0.494680	0.544021	discard	use stronger final lr decay ratio 0.05
+7b47193	0.498436	0.548941	discard	lower learning rate to 2.5e-4
+665f504	0.512295	0.538431	discard	enable series decomposition with kernel 25
+524c888	0.524986	0.573475	discard	switch encoder normalization to LayerNorm
+5795792	0.530437	0.552819	discard	use fixed sincos positional encoding
+cf4a248	0.495247	0.544328	discard	clip gradients at max_norm 1.0
+6f4bd4d	0.492687	0.531907	discard	reduce batch size to 96
+1bab1ed	0.480478	0.535286	discard	shorten warmup ratio to 0.02
+524c888	0.524986	0.573475	discard	switch encoder normalization to LayerNorm
+6b0e88c	0.504019	0.538254	discard	add head dropout 0.1
+d4960d3	0.520683	0.529752	discard	deepen encoder to four layers
+b52d080	0.538033	0.553725	discard	remove end patch padding
+64196bf	0.480757	0.537110	discard	increase batch size to 160
+6ffffd7	0.512782	0.508630	discard	reduce attention heads to two
+4c721f5	0.507005	0.550518	discard	moderately widen model
+fc98c1f	0.467000	0.531597	discard	use medium fine patches 16 stride 8
+ee558e4	0.580553	0.640779	discard	add lightweight channel mixer
+916a315	0.457537	0.485710	discard	add linear residual branch
+e7d881d	0.499517	0.522543	discard	add local patch mixer
+7d49fe2	0.518287	0.538224	discard	add gated linear residual branch
+9ccdb3f	0.514753	0.529142	discard	add per-channel linear residual branch
+49725c5	0.470874	0.528356	discard	add trend linear shortcut
+03e2756	0.494244	0.528458	discard	halve linear residual strength
+13bfa55	0.469100	0.509990	discard	center linear residual input
+f7f9317	0.472879	0.520115	discard	use bias-free linear residual branch
+1c122c2	0.490712	0.527879	discard	use recent-window linear residual
+71a6ae1	0.450449	0.471883	discard	lower lr for linear residual branch
+f58ebdb	0.453308	0.482089	discard	tune lr for linear residual branch
+de9eb72	0.447878	0.467446	discard	lengthen warmup for linear residual branch
+8c4e4a2	0.459949	0.491266	discard	reduce dropout on tuned linear residual branch
+15aeba0	0.440350	0.465096	discard	increase batch on tuned linear residual branch
+2032993	0.438858	0.467376	discard	strengthen decay on tuned linear residual branch
+89ca27d	0.438099	0.466217	discard	strengthen decay further on linear residual branch
+693f951	0.437565	0.466123	discard	lengthen warmup further on linear residual branch
+efe051a	0.444317	0.467510	discard	increase batch further on linear residual branch
+254b494	0.473122	0.492948	discard	zero init tuned linear residual branch
+5b39732	0.446007	0.468123	discard	raise lr for linear residual branch only
