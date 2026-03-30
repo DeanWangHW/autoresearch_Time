@@ -1,0 +1,108 @@
+train 6721
+Epoch 1 | steps=1 train=0.581583 elapsed=0.57s lr=0.000224175
+val 1633
+test 8589
+---
+val_mse:          1.151890
+blind_test_mse:   0.408269
+training_seconds: 0.6
+total_seconds:    0.6
+num_steps:        1
+num_epochs:       1
+stop_reason:      time_budget
+blind_test_file:  /Users/deanwang/Code/autoresearch_Time/dataset/ETTh1_blind_test.csv
+summary_path:     /Users/deanwang/Code/autoresearch_Time/runs/patchtst/results/ETTh1_smoke96_PatchTST_ETTh1_ftM_sl96_ll48_pl96_dm8_nh2_el1_df32_ebtimeF/run_summary.txt
+{
+  "device": "mps",
+  "setting": "ETTh1_smoke96_PatchTST_ETTh1_ftM_sl96_ll48_pl96_dm8_nh2_el1_df32_ebtimeF",
+  "config": {
+    "random_seed": 2021,
+    "model": "PatchTST",
+    "model_id": "ETTh1_smoke96",
+    "data": "ETTh1",
+    "root_path": "/Users/deanwang/Code/autoresearch_Time/dataset",
+    "data_path": "ETTh1_train.csv",
+    "train_data_path": "ETTh1_train.csv",
+    "blind_test_data_path": "ETTh1_blind_test.csv",
+    "features": "M",
+    "target": "OT",
+    "freq": "h",
+    "seq_len": 96,
+    "label_len": 48,
+    "pred_len": 96,
+    "patch_len": 8,
+    "stride": 4,
+    "d_model": 8,
+    "n_heads": 2,
+    "e_layers": 1,
+    "d_ff": 32,
+    "dropout": 0.1,
+    "fc_dropout": 0.1,
+    "head_dropout": 0.0,
+    "embed": "timeF",
+    "activation": "gelu",
+    "padding_patch": "end",
+    "revin": 1,
+    "affine": 0,
+    "subtract_last": 0,
+    "decomposition": 0,
+    "kernel_size": 25,
+    "individual": 0,
+    "batch_size": 8,
+    "learning_rate": 0.0003,
+    "train_time_budget": 0.01,
+    "warmup_ratio": 0.05,
+    "final_lr_ratio": 0.2,
+    "device": "auto",
+    "use_amp": false,
+    "num_workers": 0,
+    "max_train_steps": null,
+    "max_eval_steps": 1,
+    "train_val_ratio": 0.8,
+    "output_root": "/Users/deanwang/Code/autoresearch_Time/runs/patchtst",
+    "save_predictions": false,
+    "enc_in": 7,
+    "dec_in": 7,
+    "c_out": 7,
+    "results_dir": "/Users/deanwang/Code/autoresearch_Time/runs/patchtst/results",
+    "setting": "ETTh1_smoke96_PatchTST_ETTh1_ftM_sl96_ll48_pl96_dm8_nh2_el1_df32_ebtimeF"
+  },
+  "train": {
+    "history": [
+      {
+        "epoch": 1.0,
+        "train_loss": 0.5815833210945129,
+        "elapsed_seconds": 0.5711354169761762,
+        "num_steps": 1.0,
+        "learning_rate": 0.00022417499567382035
+      }
+    ],
+    "num_steps": 1,
+    "num_epochs": 1,
+    "stop_reason": "time_budget",
+    "training_seconds": 0.5712176249944605,
+    "time_budget_seconds": 0.01
+  },
+  "val": {
+    "mae": 0.7129202485084534,
+    "mse": 1.1518902778625488,
+    "rmse": 1.0732615141998472,
+    "mape": 3.7582194805145264,
+    "mspe": 356.3421325683594,
+    "rse": 0.9235715722219366,
+    "source_path": "/Users/deanwang/Code/autoresearch_Time/dataset/ETTh1_train.csv",
+    "num_windows": 1633.0
+  },
+  "test": {
+    "mae": 0.5125420689582825,
+    "mse": 0.4082692861557007,
+    "rmse": 0.6389595340518057,
+    "mape": 3.6980016231536865,
+    "mspe": 430.2257385253906,
+    "rse": 0.5382618922417334,
+    "source_path": "/Users/deanwang/Code/autoresearch_Time/dataset/ETTh1_blind_test.csv",
+    "num_windows": 8589.0
+  },
+  "total_seconds": 0.5976450839953031,
+  "summary_path": "/Users/deanwang/Code/autoresearch_Time/runs/patchtst/results/ETTh1_smoke96_PatchTST_ETTh1_ftM_sl96_ll48_pl96_dm8_nh2_el1_df32_ebtimeF/run_summary.txt"
+}
